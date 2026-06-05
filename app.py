@@ -2,11 +2,9 @@ import os
 import io
 import json
 import logging
+import base64
 import secrets
-import hashlib
-from datetime import datetime
-from functools import wraps
-from flask import Flask, request, jsonify, send_file, render_template_string, session, redirect, Response
+from flask import Flask, request, jsonify, send_file, render_template_string, Response
 import requests
 
 app = Flask(__name__)
@@ -16,860 +14,623 @@ log = logging.getLogger(__name__)
 
 ANTHROPIC_API_KEY  = os.environ.get("ANTHROPIC_API_KEY", "")
 OPENAI_API_KEY     = os.environ.get("OPENAI_API_KEY", "")
-UPSTASH_URL        = os.environ.get("UPSTASH_REDIS_REST_URL", "")
-UPSTASH_TOKEN      = os.environ.get("UPSTASH_REDIS_REST_TOKEN", "")
 ELEVENLABS_API_KEY = os.environ.get("ELEVENLABS_API_KEY", "")
-ELEVENLABS_VOICE_ID = os.environ.get("ELEVENLABS_VOICE_ID", "21m00Tcm4TlvDq8ikWAM")  # Rachel - selkeä englanti
-ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "speakup2026")
+ELEVENLABS_VOICE_ID = os.environ.get("ELEVENLABS_VOICE_ID", "21m00Tcm4TlvDq8ikWAM")
 
-REDIS_HEADERS = {
-    "Authorization": f"Bearer {UPSTASH_TOKEN}",
-    "Content-Type": "application/json"
-}
+SYSTEM_PROMPT = """You are an expert health advisor specializing in insulin resistance, diabetes prevention, and metabolic health. You work for InsuliiniCheck.fi, a Finnish company that sells home insulin testing devices.
 
-# ── Redis ────────────────────────────────────────────────────────────────
-def redis_get(key):
-    try:
-        r = requests.post(UPSTASH_URL, headers=REDIS_HEADERS, json=["GET", key], timeout=5)
-        data = r.json()
-        return json.loads(data["result"]) if data.get("result") else None
-    except Exception as e:
-        log.error(f"Redis get error: {e}")
-        return None
+Your expertise includes:
+- Insulin resistance and its causes
+- Type 2 diabetes prevention
+- The importance of insulin testing vs blood sugar testing
+- Diet and nutrition for metabolic health
+- Exercise and lifestyle changes
+- Medications like metformin
+- How to interpret insulin test results
+- The InsuliiniCheck home testing device (399€) and test strips (15€ each)
 
-def redis_set(key, value, ttl=None):
-    try:
-        cmd = ["SET", key, json.dumps(value)]
-        if ttl:
-            cmd += ["EX", ttl]
-        requests.post(UPSTASH_URL, headers=REDIS_HEADERS, json=cmd, timeout=5)
-    except Exception as e:
-        log.error(f"Redis set error: {e}")
+IMPORTANT RULES:
+- Always detect the language the user is writing/speaking in and respond in the SAME language
+- Keep answers clear, simple and encouraging — not too long
+- Always recommend consulting a doctor for personal medical advice
+- When relevant, mention that home insulin testing with InsuliiniCheck can help monitor progress
+- Be warm, supportive and motivating
+- Never diagnose diseases — give educational information only"""
 
-def redis_keys(pattern):
-    try:
-        r = requests.post(UPSTASH_URL, headers=REDIS_HEADERS, json=["KEYS", pattern], timeout=5)
-        return r.json().get("result", [])
-    except:
-        return []
-
-def hash_password(password):
-    return hashlib.sha256(password.encode()).hexdigest()
-
-def login_required(f):
-    @wraps(f)
-    def decorated(*args, **kwargs):
-        if "user_email" not in session:
-            return redirect("/login")
-        return f(*args, **kwargs)
-    return decorated
-
-# ── Scenarios ────────────────────────────────────────────────────────────
-SCENARIOS = [
-    {"id": "restaurant", "emoji": "🍽️", "title": "At a Restaurant", "desc": "Order food, ask about the menu, make requests"},
-    {"id": "airport", "emoji": "✈️", "title": "At the Airport", "desc": "Check-in, security, boarding gates"},
-    {"id": "job_interview", "emoji": "💼", "title": "Job Interview", "desc": "Answer questions about your experience and skills"},
-    {"id": "shopping", "emoji": "🛍️", "title": "Shopping", "desc": "Ask about products, prices, sizes"},
-    {"id": "doctor", "emoji": "🏥", "title": "At the Doctor", "desc": "Describe symptoms, understand advice"},
-    {"id": "hotel", "emoji": "🏨", "title": "Hotel Check-in", "desc": "Book a room, ask about facilities"},
-    {"id": "directions", "emoji": "🗺️", "title": "Asking Directions", "desc": "Find your way around a new city"},
-    {"id": "free", "emoji": "💬", "title": "Free Conversation", "desc": "Talk about anything you like"},
-]
-
-SCENARIO_PROMPTS = {
-    "restaurant": "You are a friendly restaurant waiter in an English-speaking country. The customer may have limited English. Be patient, speak clearly, and help them order food. Keep responses short (1-3 sentences).",
-    "airport": "You are a helpful airport staff member. The traveler may have limited English. Help them with check-in, directions, and boarding. Keep responses short (1-3 sentences).",
-    "job_interview": "You are a friendly HR interviewer. The candidate may have limited English. Ask simple interview questions and encourage them. Keep responses short (1-3 sentences).",
-    "shopping": "You are a helpful shop assistant. The customer may have limited English. Help them find products and answer questions about prices and sizes. Keep responses short (1-3 sentences).",
-    "doctor": "You are a patient and clear doctor. The patient may have limited English. Ask about their symptoms and explain advice simply. Keep responses short (1-3 sentences).",
-    "hotel": "You are a friendly hotel receptionist. The guest may have limited English. Help them check in and answer questions about the hotel. Keep responses short (1-3 sentences).",
-    "directions": "You are a friendly local helping a tourist. The tourist may have limited English. Give clear, simple directions. Keep responses short (1-3 sentences).",
-    "free": "You are a friendly English conversation partner. The user may have limited English. Have a natural conversation on any topic they choose. Keep responses short (1-3 sentences).",
-}
-
-FEEDBACK_PROMPT = """You are an English language coach for adult learners. 
-The student just said: "{speech}"
-
-Their target scenario: {scenario}
-
-Analyze their English and provide feedback in this exact JSON format:
-{{
-  "corrected": "The corrected version of what they said (if needed, otherwise same)",
-  "feedback": "One short, encouraging sentence about their English (max 15 words)",
-  "errors": ["error1 if any", "error2 if any"],
-  "score": 85
-}}
-
-Score 0-100 based on grammar, vocabulary and clarity.
-If their English was good, say so! Be encouraging.
-Respond ONLY with the JSON object."""
-
-# ── HTML ─────────────────────────────────────────────────────────────────
-MAIN_HTML = """<!DOCTYPE html>
-<html lang="en">
+HTML = """<!DOCTYPE html>
+<html lang="fi">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
-<title>SpeakUp — English Coach</title>
-<meta name="apple-mobile-web-app-capable" content="yes">
-<meta name="theme-color" content="#0a0a0f">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>InsuliiniCheck — Mittaa insuliinisi kotona</title>
+<meta name="description" content="Insuliiniresistenssi on diabeteksen esiaste. Mittaa insuliinisi kotona ennen kuin on liian myöhäistä.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:ital,wght@0,300;0,400;0,600;0,700;1,300&family=DM+Sans:wght@300;400;500&display=swap" rel="stylesheet">
 <style>
-  @import url('https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&family=DM+Sans:wght@300;400;500&display=swap');
-  :root {
-    --bg: #0a0a0f;
-    --surface: #13131a;
-    --surface2: #1c1c28;
-    --accent: #00e5a0;
-    --accent2: #00b8ff;
-    --warn: #ff6b35;
-    --text: #f0f0f8;
-    --text2: #7070a0;
-    --border: rgba(255,255,255,0.06);
-    --glow: rgba(0,229,160,0.15);
-  }
-  * { margin:0; padding:0; box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
-  body { font-family:'DM Sans',sans-serif; background:var(--bg); color:var(--text); min-height:100vh; display:flex; flex-direction:column; align-items:center; }
-  .header { width:100%; padding:18px 20px; display:flex; align-items:center; gap:12px; border-bottom:1px solid var(--border); background:rgba(10,10,15,0.9); backdrop-filter:blur(12px); position:sticky; top:0; z-index:100; }
-  .logo { font-family:'Syne',sans-serif; font-weight:800; font-size:20px; background:linear-gradient(135deg,var(--accent),var(--accent2)); -webkit-background-clip:text; -webkit-text-fill-color:transparent; }
-  .tagline { font-size:12px; color:var(--text2); }
-  .nav-link { margin-left:auto; font-size:13px; color:var(--text2); text-decoration:none; padding:6px 12px; border-radius:8px; border:1px solid var(--border); }
-  .container { width:100%; max-width:500px; padding:20px 16px; flex:1; display:flex; flex-direction:column; gap:16px; }
-  .section-title { font-family:'Syne',sans-serif; font-size:11px; font-weight:700; text-transform:uppercase; letter-spacing:2px; color:var(--text2); margin-bottom:12px; }
-  .scenarios { display:grid; grid-template-columns:repeat(2,1fr); gap:10px; }
-  .scenario-card { background:var(--surface); border:1px solid var(--border); border-radius:14px; padding:14px; cursor:pointer; transition:all 0.2s; display:flex; flex-direction:column; gap:6px; }
-  .scenario-card:active { transform:scale(0.97); }
-  .scenario-card.selected { border-color:var(--accent); background:rgba(0,229,160,0.08); box-shadow:0 0 20px var(--glow); }
-  .scenario-emoji { font-size:24px; }
-  .scenario-title { font-family:'Syne',sans-serif; font-size:13px; font-weight:600; }
-  .scenario-desc { font-size:11px; color:var(--text2); line-height:1.4; }
-  .record-card { background:var(--surface); border:1px solid var(--border); border-radius:20px; padding:24px; display:flex; flex-direction:column; align-items:center; gap:16px; }
-  .record-btn { width:96px; height:96px; border-radius:50%; border:none; cursor:pointer; display:flex; align-items:center; justify-content:center; font-size:36px; transition:all 0.2s; background:linear-gradient(135deg,var(--accent),var(--accent2)); box-shadow:0 8px 32px rgba(0,229,160,0.3); }
-  .record-btn.recording { background:linear-gradient(135deg,var(--warn),#ff3366); box-shadow:0 8px 32px rgba(255,107,53,0.4); animation:pulse 1.5s infinite; }
-  .record-btn:disabled { opacity:0.4; cursor:not-allowed; }
-  @keyframes pulse { 0%,100%{transform:scale(1);}50%{transform:scale(1.05);} }
-  .record-hint { font-size:13px; color:var(--text2); text-align:center; }
-  .timer { font-family:'Syne',sans-serif; font-size:32px; font-weight:700; color:var(--accent); display:none; }
-  .timer.visible { display:block; }
-  .wave { display:none; gap:4px; align-items:flex-end; height:28px; }
-  .wave.visible { display:flex; }
-  .wave span { width:4px; background:var(--warn); border-radius:2px; animation:wave 0.7s ease-in-out infinite; }
-  .wave span:nth-child(2){animation-delay:0.1s;height:14px;}
-  .wave span:nth-child(3){animation-delay:0.2s;height:20px;}
-  .wave span:nth-child(4){animation-delay:0.3s;height:10px;}
-  .wave span:nth-child(5){animation-delay:0.4s;height:18px;}
-  @keyframes wave{0%,100%{transform:scaleY(0.4);}50%{transform:scaleY(1);}}
+:root {
+  --cream: #faf7f2; --warm: #f5ede0; --brown: #3d2b1f; --brown2: #6b4c3b;
+  --accent: #c4622d; --accent2: #e8a87c; --green: #2d6a4f; --green2: #52b788;
+  --red: #c1121f; --text: #2a1f1a; --text2: #7a6055; --border: rgba(61,43,31,0.1);
+}
+* { margin:0; padding:0; box-sizing:border-box; }
+html { scroll-behavior:smooth; }
+body { font-family:'DM Sans',sans-serif; background:var(--cream); color:var(--text); overflow-x:hidden; }
 
-  /* Speaking animation */
-  .speaking-indicator { display:none; align-items:center; gap:8px; font-size:13px; color:var(--accent2); }
-  .speaking-indicator.visible { display:flex; }
-  .speak-wave { display:flex; gap:3px; align-items:flex-end; height:20px; }
-  .speak-wave span { width:3px; background:var(--accent2); border-radius:2px; animation:wave 0.6s ease-in-out infinite; }
-  .speak-wave span:nth-child(2){animation-delay:0.1s;}
-  .speak-wave span:nth-child(3){animation-delay:0.2s;}
+/* NAV */
+.nav { position:fixed; top:0; left:0; right:0; z-index:100; padding:16px 24px; display:flex; align-items:center; justify-content:space-between; background:rgba(61,43,31,0.95); backdrop-filter:blur(12px); border-bottom:1px solid rgba(255,255,255,0.08); }
+.nav-logo { font-family:'Fraunces',serif; font-size:20px; color:var(--accent2); font-weight:600; }
+.nav-cta { background:var(--accent); color:white; padding:8px 18px; border-radius:100px; font-size:13px; font-weight:500; text-decoration:none; }
 
-  .ai-bubble { background:var(--surface2); border-radius:16px; padding:16px; font-size:14px; line-height:1.6; border-left:3px solid var(--accent2); display:none; }
-  .ai-bubble.visible { display:block; }
-  .ai-label { font-size:10px; font-weight:600; text-transform:uppercase; letter-spacing:1.5px; color:var(--accent2); margin-bottom:8px; display:flex; align-items:center; justify-content:space-between; }
-  .replay-btn { background:rgba(0,184,255,0.1); border:1px solid rgba(0,184,255,0.2); color:var(--accent2); padding:4px 10px; border-radius:20px; font-size:11px; cursor:pointer; font-family:'DM Sans',sans-serif; }
-  .replay-btn:hover { background:rgba(0,184,255,0.2); }
+/* HERO */
+.hero { min-height:100vh; background:var(--brown); display:flex; flex-direction:column; align-items:center; justify-content:center; padding:80px 24px 60px; position:relative; overflow:hidden; text-align:center; }
+.hero::before { content:''; position:absolute; width:600px; height:600px; background:radial-gradient(circle,rgba(196,98,45,0.3) 0%,transparent 70%); top:-100px; right:-100px; pointer-events:none; }
+.hero-badge { display:inline-block; background:rgba(196,98,45,0.2); border:1px solid rgba(196,98,45,0.4); color:var(--accent2); padding:6px 16px; border-radius:100px; font-size:12px; font-weight:500; letter-spacing:1.5px; text-transform:uppercase; margin-bottom:24px; }
+.hero h1 { font-family:'Fraunces',serif; font-size:clamp(36px,7vw,64px); line-height:1.1; color:white; margin-bottom:20px; font-weight:600; }
+.hero h1 em { font-style:italic; color:var(--accent2); }
+.hero p { font-size:18px; color:rgba(255,255,255,0.7); line-height:1.7; margin-bottom:40px; max-width:580px; }
+.hero-buttons { display:flex; gap:12px; justify-content:center; flex-wrap:wrap; }
+.btn-primary { background:var(--accent); color:white; padding:16px 32px; border-radius:100px; font-size:15px; font-weight:500; text-decoration:none; box-shadow:0 8px 32px rgba(196,98,45,0.4); }
+.btn-secondary { background:rgba(255,255,255,0.1); color:white; padding:16px 32px; border-radius:100px; font-size:15px; font-weight:500; text-decoration:none; border:1px solid rgba(255,255,255,0.2); }
+.hero-stats { display:flex; gap:40px; justify-content:center; margin-top:60px; flex-wrap:wrap; }
+.stat-num { font-family:'Fraunces',serif; font-size:36px; color:var(--accent2); font-weight:700; }
+.stat-label { font-size:12px; color:rgba(255,255,255,0.5); text-transform:uppercase; letter-spacing:1px; margin-top:4px; }
+.stat-sub { font-size:11px; color:rgba(255,255,255,0.4); margin-top:2px; }
 
-  .feedback-card { background:var(--surface); border:1px solid var(--border); border-radius:16px; padding:16px; display:none; flex-direction:column; gap:12px; }
-  .feedback-card.visible { display:flex; }
-  .score-row { display:flex; align-items:center; gap:12px; }
-  .score-circle { width:56px; height:56px; border-radius:50%; display:flex; align-items:center; justify-content:center; font-family:'Syne',sans-serif; font-weight:800; font-size:16px; flex-shrink:0; }
-  .score-high { background:rgba(0,229,160,0.15); color:var(--accent); border:2px solid var(--accent); }
-  .score-mid { background:rgba(0,184,255,0.15); color:var(--accent2); border:2px solid var(--accent2); }
-  .score-low { background:rgba(255,107,53,0.15); color:var(--warn); border:2px solid var(--warn); }
-  .feedback-text { font-size:14px; line-height:1.5; }
-  .corrected-box { background:rgba(0,229,160,0.08); border-radius:10px; padding:12px; font-size:13px; border:1px solid rgba(0,229,160,0.2); }
-  .corrected-label { font-size:10px; color:var(--accent); font-weight:600; text-transform:uppercase; letter-spacing:1px; margin-bottom:6px; }
-  .errors-list { display:flex; flex-direction:column; gap:6px; }
-  .error-item { background:rgba(255,107,53,0.08); border-radius:8px; padding:8px 12px; font-size:12px; color:var(--warn); border:1px solid rgba(255,107,53,0.2); }
-  .chat-history { display:flex; flex-direction:column; gap:10px; }
-  .msg-user { background:linear-gradient(135deg,rgba(0,229,160,0.12),rgba(0,184,255,0.08)); border-radius:14px 14px 4px 14px; padding:12px 14px; font-size:14px; align-self:flex-end; max-width:85%; border:1px solid rgba(0,229,160,0.2); }
-  .msg-ai { background:var(--surface2); border-radius:14px 14px 14px 4px; padding:12px 14px; font-size:14px; align-self:flex-start; max-width:85%; }
-  .msg-label { font-size:10px; font-weight:600; text-transform:uppercase; letter-spacing:1px; margin-bottom:4px; }
-  .msg-label.you { color:var(--accent); }
-  .msg-label.ai { color:var(--accent2); }
-  .error-msg { background:rgba(255,107,53,0.1); border:1px solid rgba(255,107,53,0.3); border-radius:10px; padding:12px; font-size:13px; color:var(--warn); display:none; }
-  .error-msg.visible { display:block; }
-  .btn { width:100%; padding:14px; border-radius:12px; border:none; font-family:'Syne',sans-serif; font-size:14px; font-weight:700; cursor:pointer; transition:all 0.2s; letter-spacing:0.5px; }
-  .btn-primary { background:linear-gradient(135deg,var(--accent),var(--accent2)); color:#0a0a0f; }
-  .btn-secondary { background:var(--surface2); color:var(--text); border:1px solid var(--border); }
-  .btn:disabled { opacity:0.4; cursor:not-allowed; }
-  .processing { display:none; flex-direction:column; gap:8px; }
-  .processing.visible { display:flex; }
-  .proc-step { display:flex; align-items:center; gap:10px; font-size:13px; color:var(--text2); padding:8px 0; }
-  .proc-step.active { color:var(--text); }
-  .proc-step.done { color:var(--accent); }
-  .spinner { width:16px; height:16px; border:2px solid rgba(255,255,255,0.1); border-top-color:var(--accent); border-radius:50%; animation:spin 0.8s linear infinite; flex-shrink:0; }
-  @keyframes spin { to{transform:rotate(360deg);} }
-  @keyframes glow { 0%,100%{box-shadow:0 4px 20px rgba(0,184,255,0.4);}50%{box-shadow:0 4px 32px rgba(0,229,160,0.7);} }
+/* SECTIONS */
+section { padding:80px 24px; max-width:900px; margin:0 auto; }
+.section-label { font-size:11px; font-weight:600; text-transform:uppercase; letter-spacing:2px; color:var(--accent); margin-bottom:12px; }
+.section-title { font-family:'Fraunces',serif; font-size:clamp(28px,5vw,44px); line-height:1.2; color:var(--brown); margin-bottom:20px; font-weight:600; }
+.section-title em { font-style:italic; color:var(--accent); }
+.section-text { font-size:17px; line-height:1.8; color:var(--text2); max-width:640px; }
+
+/* PROBLEM */
+.problem-section { background:var(--warm); padding:80px 24px; }
+.problem-inner { max-width:900px; margin:0 auto; }
+.problem-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(260px,1fr)); gap:20px; margin-top:40px; }
+.problem-card { background:white; border-radius:20px; padding:28px; border:1px solid var(--border); }
+.problem-icon { font-size:32px; margin-bottom:16px; }
+.problem-card h3 { font-family:'Fraunces',serif; font-size:20px; color:var(--brown); margin-bottom:10px; font-weight:600; }
+.problem-card p { font-size:14px; line-height:1.7; color:var(--text2); }
+.warning-box { background:rgba(193,18,31,0.06); border:1px solid rgba(193,18,31,0.2); border-radius:16px; padding:24px 28px; margin:40px 0; display:flex; gap:16px; align-items:flex-start; }
+.warning-icon { font-size:28px; flex-shrink:0; }
+.warning-text h4 { font-family:'Fraunces',serif; font-size:18px; color:var(--red); margin-bottom:8px; }
+.warning-text p { font-size:14px; line-height:1.7; color:var(--text2); }
+
+/* COMPARISON */
+.comparison { display:grid; grid-template-columns:1fr 1fr; gap:20px; margin-top:40px; }
+.comp-card { border-radius:20px; padding:28px; }
+.comp-bad { background:rgba(193,18,31,0.05); border:1px solid rgba(193,18,31,0.15); }
+.comp-good { background:rgba(45,106,79,0.05); border:1px solid rgba(45,106,79,0.2); }
+.comp-label { font-size:11px; font-weight:700; text-transform:uppercase; letter-spacing:1.5px; margin-bottom:16px; }
+.comp-bad .comp-label { color:var(--red); }
+.comp-good .comp-label { color:var(--green); }
+.comp-card h3 { font-family:'Fraunces',serif; font-size:22px; margin-bottom:12px; }
+.comp-bad h3 { color:var(--red); }
+.comp-good h3 { color:var(--green); }
+.comp-list { list-style:none; }
+.comp-list li { font-size:14px; line-height:1.6; color:var(--text2); padding:6px 0; border-bottom:1px solid var(--border); display:flex; gap:8px; }
+.comp-list li:last-child { border-bottom:none; }
+
+/* SOLUTIONS */
+.solution-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(200px,1fr)); gap:16px; margin-top:40px; }
+.solution-card { background:white; border-radius:16px; padding:24px; border:1px solid var(--border); text-align:center; }
+.solution-emoji { font-size:36px; margin-bottom:12px; }
+.solution-card h3 { font-family:'Fraunces',serif; font-size:16px; color:var(--brown); margin-bottom:8px; font-weight:600; }
+.solution-card p { font-size:13px; line-height:1.6; color:var(--text2); }
+
+/* PRODUCT */
+.product-section { background:var(--brown); padding:80px 24px; }
+.product-inner { max-width:900px; margin:0 auto; }
+.product-inner .section-title { color:white; }
+.product-inner .section-label { color:var(--accent2); }
+.product-grid { display:grid; grid-template-columns:1fr 1fr; gap:24px; margin-top:40px; }
+.product-card { background:rgba(255,255,255,0.06); border:1px solid rgba(255,255,255,0.1); border-radius:24px; padding:32px; }
+.product-card.featured { background:var(--accent); border-color:var(--accent); grid-column:span 2; }
+.product-img { width:100%; height:200px; background:rgba(255,255,255,0.1); border-radius:16px; display:flex; align-items:center; justify-content:center; font-size:64px; margin-bottom:20px; overflow:hidden; }
+.product-img img { width:100%; height:100%; object-fit:contain; padding:16px; }
+.product-name { font-family:'Fraunces',serif; font-size:22px; color:white; margin-bottom:8px; font-weight:600; }
+.product-desc { font-size:14px; color:rgba(255,255,255,0.65); line-height:1.6; margin-bottom:20px; }
+.product-price { font-family:'Fraunces',serif; font-size:32px; color:var(--accent2); margin-bottom:4px; }
+.product-card.featured .product-price { color:white; }
+.product-price-sub { font-size:13px; color:rgba(255,255,255,0.5); margin-bottom:20px; }
+.product-features { list-style:none; margin-bottom:24px; }
+.product-features li { font-size:13px; color:rgba(255,255,255,0.7); padding:6px 0; display:flex; gap:8px; border-bottom:1px solid rgba(255,255,255,0.08); }
+.product-features li:last-child { border-bottom:none; }
+.btn-buy { width:100%; padding:14px; border-radius:12px; border:none; font-family:'DM Sans',sans-serif; font-size:15px; font-weight:600; cursor:pointer; text-decoration:none; display:block; text-align:center; }
+.btn-buy-primary { background:white; color:var(--brown); }
+.btn-buy-secondary { background:rgba(255,255,255,0.1); color:white; border:1px solid rgba(255,255,255,0.2); }
+
+/* FAQ */
+.faq-section { background:var(--warm); padding:80px 24px; }
+.faq-inner { max-width:700px; margin:0 auto; }
+.faq-list { margin-top:40px; display:flex; flex-direction:column; gap:12px; }
+.faq-item { background:white; border-radius:16px; border:1px solid var(--border); overflow:hidden; }
+.faq-q { padding:20px 24px; font-size:16px; font-weight:500; color:var(--brown); cursor:pointer; display:flex; justify-content:space-between; align-items:center; }
+.faq-icon { font-size:20px; transition:transform 0.2s; color:var(--accent); }
+.faq-item.open .faq-icon { transform:rotate(45deg); }
+.faq-a { padding:0 24px; max-height:0; overflow:hidden; transition:all 0.3s; font-size:14px; line-height:1.7; color:var(--text2); }
+.faq-item.open .faq-a { max-height:300px; padding:0 24px 20px; }
+
+/* CTA */
+.cta-section { background:linear-gradient(135deg,var(--accent) 0%,#a0522d 100%); padding:80px 24px; text-align:center; }
+.cta-section h2 { font-family:'Fraunces',serif; font-size:clamp(28px,5vw,44px); color:white; margin-bottom:16px; font-weight:600; }
+.cta-section p { font-size:17px; color:rgba(255,255,255,0.8); margin-bottom:36px; max-width:500px; margin-left:auto; margin-right:auto; }
+.btn-cta { background:white; color:var(--accent); padding:18px 40px; border-radius:100px; font-size:16px; font-weight:600; text-decoration:none; display:inline-block; }
+
+/* FOOTER */
+footer { background:var(--brown); padding:40px 24px; text-align:center; }
+.footer-logo { font-family:'Fraunces',serif; font-size:22px; color:var(--accent2); margin-bottom:16px; }
+footer p { font-size:13px; color:rgba(255,255,255,0.4); line-height:1.8; }
+
+/* ── CHAT WIDGET ── */
+.chat-fab { position:fixed; bottom:24px; right:24px; z-index:1000; width:60px; height:60px; border-radius:50%; background:linear-gradient(135deg,var(--accent),#a0522d); border:none; cursor:pointer; font-size:28px; box-shadow:0 8px 32px rgba(196,98,45,0.5); display:flex; align-items:center; justify-content:center; transition:transform 0.2s; }
+.chat-fab:hover { transform:scale(1.1); }
+.chat-fab.open { background:linear-gradient(135deg,#6b4c3b,var(--brown)); }
+
+.chat-window { position:fixed; bottom:96px; right:24px; z-index:999; width:360px; max-width:calc(100vw - 48px); background:var(--cream); border-radius:20px; box-shadow:0 20px 60px rgba(0,0,0,0.2); border:1px solid var(--border); display:none; flex-direction:column; overflow:hidden; max-height:520px; }
+.chat-window.open { display:flex; }
+
+.chat-header { background:var(--brown); padding:16px 20px; display:flex; align-items:center; gap:12px; }
+.chat-avatar { width:36px; height:36px; border-radius:50%; background:var(--accent); display:flex; align-items:center; justify-content:center; font-size:18px; }
+.chat-header-text h3 { font-family:'Fraunces',serif; font-size:15px; color:white; font-weight:600; }
+.chat-header-text p { font-size:11px; color:rgba(255,255,255,0.6); }
+.chat-close { margin-left:auto; background:none; border:none; color:rgba(255,255,255,0.6); font-size:20px; cursor:pointer; }
+
+.chat-messages { flex:1; overflow-y:auto; padding:16px; display:flex; flex-direction:column; gap:12px; min-height:200px; }
+.msg { max-width:85%; padding:10px 14px; border-radius:16px; font-size:14px; line-height:1.5; }
+.msg-ai { background:white; color:var(--text); border-radius:16px 16px 16px 4px; border:1px solid var(--border); align-self:flex-start; }
+.msg-user { background:var(--accent); color:white; border-radius:16px 16px 4px 16px; align-self:flex-end; }
+.msg-typing { background:white; border:1px solid var(--border); border-radius:16px 16px 16px 4px; align-self:flex-start; padding:12px 16px; }
+.typing-dots { display:flex; gap:4px; }
+.typing-dots span { width:6px; height:6px; background:var(--text2); border-radius:50%; animation:bounce 1.2s infinite; }
+.typing-dots span:nth-child(2){animation-delay:0.2s;}
+.typing-dots span:nth-child(3){animation-delay:0.4s;}
+@keyframes bounce{0%,60%,100%{transform:translateY(0);}30%{transform:translateY(-6px);}}
+
+.chat-input-row { padding:12px 16px; border-top:1px solid var(--border); display:flex; gap:8px; align-items:center; background:white; }
+.chat-input { flex:1; border:1px solid var(--border); border-radius:10px; padding:10px 14px; font-size:14px; font-family:'DM Sans',sans-serif; outline:none; background:var(--cream); }
+.chat-input:focus { border-color:var(--accent); }
+.chat-send { width:38px; height:38px; border-radius:10px; border:none; background:var(--accent); color:white; font-size:16px; cursor:pointer; flex-shrink:0; display:flex; align-items:center; justify-content:center; }
+.chat-mic { width:38px; height:38px; border-radius:10px; border:none; background:var(--warm); color:var(--brown); font-size:16px; cursor:pointer; flex-shrink:0; display:flex; align-items:center; justify-content:center; border:1px solid var(--border); }
+.chat-mic.recording { background:var(--red); color:white; animation:pulse 1s infinite; }
+@keyframes pulse{0%,100%{opacity:1;}50%{opacity:0.6;}}
+
+.chat-play { width:100%; margin-top:8px; padding:8px; border-radius:8px; border:none; background:linear-gradient(135deg,var(--accent),#a0522d); color:white; font-size:13px; font-weight:600; cursor:pointer; display:none; }
+
+@media(max-width:400px){ .chat-window{right:12px;left:12px;width:auto;} }
+@media(max-width:600px){ .comparison{grid-template-columns:1fr;} .product-grid{grid-template-columns:1fr;} .product-card.featured{grid-column:span 1;} }
 </style>
 </head>
 <body>
-<div class="header">
-  <div>
-    <div class="logo">SpeakUp</div>
-    <div class="tagline">English Coach</div>
+
+<nav class="nav">
+  <div class="nav-logo">InsuliiniCheck</div>
+  <a href="#tilaa" class="nav-cta">Tilaa nyt</a>
+</nav>
+
+<div class="hero">
+  <div class="hero-badge">🩸 Uusi kotimittauslaite</div>
+  <h1>Mittaa insuliinisi <em>ennen</em> kuin on liian myöhäistä</h1>
+  <p>Lääkärit mittaavat vain verensokeria. Mutta insuliini kertoo totuuden — jopa 10 vuotta ennen diabetesta. Nyt voit mitata sen kotona.</p>
+  <div class="hero-buttons">
+    <a href="#tilaa" class="btn-primary">🛒 Tilaa mittauslaite</a>
+    <a href="#miksi" class="btn-secondary">Lue lisää</a>
   </div>
-  <a href="/logout" class="nav-link">Sign out</a>
+  <div class="hero-stats">
+    <div><div class="stat-num">1/3</div><div class="stat-label">Suomalaisista</div><div class="stat-sub">insuliiniresistenssiä</div></div>
+    <div><div class="stat-num">10v</div><div class="stat-label">Ennen diabetesta</div><div class="stat-sub">kehittyy hiljalleen</div></div>
+    <div><div class="stat-num">95%</div><div class="stat-label">Ehkäistävissä</div><div class="stat-sub">oikeilla toimilla</div></div>
+  </div>
 </div>
 
-<div class="container">
-  <div id="scenarioSection">
-    <div class="section-title">Choose a scenario</div>
-    <div class="scenarios" id="scenarioGrid"></div>
-  </div>
-
-  <div class="record-card">
-    <div class="timer" id="timer">00:00</div>
-    <button class="record-btn" id="recordBtn" onclick="toggleRecording()" disabled>🎙️</button>
-    <div class="wave" id="wave"><span></span><span></span><span></span><span></span><span></span></div>
-    <div class="record-hint" id="recordHint">Select a scenario to start</div>
-  </div>
-
-  <div class="error-msg" id="errorMsg"></div>
-
-  <div class="processing" id="processing">
-    <div class="proc-step" id="proc1"><div class="spinner"></div><span>Listening to your speech...</span></div>
-    <div class="proc-step" id="proc2"><div class="spinner" style="opacity:0.3"></div><span>AI is responding...</span></div>
-    <div class="proc-step" id="proc3"><div class="spinner" style="opacity:0.3"></div><span>Analyzing your English...</span></div>
-    <div class="proc-step" id="proc4"><div class="spinner" style="opacity:0.3"></div><span>Preparing voice response...</span></div>
-  </div>
-
-  <div class="ai-bubble" id="aiBubble">
-    <div class="ai-label">🤖 Coach says</div>
-    <div id="aiText"></div>
-    <button id="playBtn" onclick="replayAudio()" style="display:none;width:100%;margin-top:14px;padding:16px;border-radius:12px;border:none;background:linear-gradient(135deg,#00b8ff,#00e5a0);color:#0a0a0f;font-size:16px;font-weight:700;cursor:pointer;letter-spacing:0.5px;animation:glow 1.5s ease-in-out infinite;">
-      🔊 Tap to hear Coach speak
-    </button>
-    <div class="speaking-indicator" id="speakingIndicator" style="margin-top:8px;">
-      <div class="speak-wave"><span></span><span></span><span></span></div>
-      <span>Speaking...</span>
+<div class="problem-section" id="miksi">
+  <div class="problem-inner">
+    <div class="section-label">Ongelma</div>
+    <h2 class="section-title">Miksi sokerin mittaus <em>ei riitä?</em></h2>
+    <p class="section-text">Verensokeri nousee vasta kun haima on jo ylikuormittunut vuosia. Insuliini sen sijaan alkaa nousta jo kauan ennen.</p>
+    <div class="warning-box">
+      <div class="warning-icon">⚠️</div>
+      <div class="warning-text">
+        <h4>Tiedätkö tämän?</h4>
+        <p>Voit olla täysin "normaali" sokeritesteissä mutta silti kärsitä vakavasta insuliiniresistenssistä vuosia — ja tietämättäsi kehittää tyypin 2 diabetesta.</p>
+      </div>
+    </div>
+    <div class="problem-grid">
+      <div class="problem-card"><div class="problem-icon">🍬</div><h3>Insuliiniresistenssi</h3><p>Solut lakkaavat reagoimasta insuliiniin. Haima pumppaa enemmän insuliinia — verensokeri pysyy normaalina, mutta vahinko kasvaa.</p></div>
+      <div class="problem-card"><div class="problem-icon">📈</div><h3>Hiljainen kehitys</h3><p>Ei oireita vuosiin. Väsymys, ylipaino ja keskivartalolihavuus voivat olla merkkejä — mutta ne ohitetaan usein.</p></div>
+      <div class="problem-card"><div class="problem-icon">🏥</div><h3>Lääkäri ei mittaa</h3><p>Rutiinitesteissä mitataan vain verensokeri ja HbA1c. Insuliinia ei mitata — vaikka se antaisi varhaisen varoituksen.</p></div>
     </div>
   </div>
+</div>
 
-  <div class="feedback-card" id="feedbackCard">
-    <div class="section-title">Your English feedback</div>
-    <div class="score-row">
-      <div class="score-circle" id="scoreCircle">--</div>
-      <div class="feedback-text" id="feedbackText"></div>
+<section>
+  <div class="section-label">Vertailu</div>
+  <h2 class="section-title">Sokeri vs. <em>Insuliini</em></h2>
+  <div class="comparison">
+    <div class="comp-card comp-bad">
+      <div class="comp-label">❌ Pelkkä sokeri</div>
+      <h3>Liian myöhään</h3>
+      <ul class="comp-list">
+        <li>🔴 Nousee vasta kun haima ylikuormittunut</li>
+        <li>🔴 Ei kerro insuliiniresistenssistä</li>
+        <li>🔴 Näyttää "normaalin" liian kauan</li>
+        <li>🔴 Diagnoosi tulee liian myöhään</li>
+      </ul>
     </div>
-    <div class="corrected-box" id="correctedBox" style="display:none">
-      <div class="corrected-label">✨ Better way to say it</div>
-      <div id="correctedText"></div>
+    <div class="comp-card comp-good">
+      <div class="comp-label">✅ Insuliinitesti</div>
+      <h3>Varhainen varoitus</h3>
+      <ul class="comp-list">
+        <li>🟢 Paljastaa resistenssin jopa 10v. ennen</li>
+        <li>🟢 Näyttää kuinka kovasti haima työskentelee</li>
+        <li>🟢 Mahdollistaa ajoissa puuttumisen</li>
+        <li>🟢 Nyt mitattavissa kotona</li>
+      </ul>
     </div>
-    <div class="errors-list" id="errorsList"></div>
   </div>
+</section>
 
-  <div class="chat-history" id="chatHistory"></div>
+<div style="background:var(--warm);padding:80px 24px;">
+  <section style="padding:0">
+    <div class="section-label">Ratkaisu</div>
+    <h2 class="section-title">Miten <em>korjata</em> insuliiniresistenssi?</h2>
+    <div class="solution-grid">
+      <div class="solution-card"><div class="solution-emoji">🥗</div><h3>Ruokavalio</h3><p>Vähemmän nopeita hiilihydraatteja, enemmän proteiinia ja hyviä rasvoja.</p></div>
+      <div class="solution-card"><div class="solution-emoji">🏃</div><h3>Liikunta</h3><p>Jo 30 min/päivä parantaa insuliiniherkkyyttä merkittävästi.</p></div>
+      <div class="solution-card"><div class="solution-emoji">😴</div><h3>Uni ja stressi</h3><p>Univaje ja stressi heikentävät insuliiniherkkyyttä suoraan.</p></div>
+      <div class="solution-card"><div class="solution-emoji">💊</div><h3>Lääkitys</h3><p>Tarvittaessa lääkäri voi määrätä esim. metformiinin.</p></div>
+      <div class="solution-card"><div class="solution-emoji">⚖️</div><h3>Painonhallinta</h3><p>Jo 5–10% painonlasku parantaa insuliiniherkkyyttä huomattavasti.</p></div>
+      <div class="solution-card"><div class="solution-emoji">📊</div><h3>Seuranta</h3><p>Mittaa insuliinisi säännöllisesti ja seuraa edistymistä.</p></div>
+    </div>
+  </section>
+</div>
 
-  <button class="btn btn-secondary" id="nextBtn" onclick="nextTurn()" style="display:none">🎙️ Speak again</button>
-  <button class="btn btn-secondary" onclick="resetAll()" style="margin-top:4px;display:none" id="resetBtn">🔄 New scenario</button>
+<div class="product-section" id="tilaa">
+  <div class="product-inner">
+    <div class="section-label">Tuotteet</div>
+    <h2 class="section-title">Tilaa InsuliiniCheck</h2>
+    <div class="product-grid">
+      <div class="product-card featured">
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:24px;align-items:center;">
+          <div class="product-img" id="deviceImage">📱</div>
+          <div>
+            <div style="font-size:11px;color:rgba(255,255,255,0.6);text-transform:uppercase;letter-spacing:1.5px;margin-bottom:8px;">⭐ Suosituimmat</div>
+            <div class="product-name">InsuliiniCheck Laite</div>
+            <div class="product-desc">Ammattitason insuliinimittaus kotona.</div>
+            <div class="product-price">399 €</div>
+            <div class="product-price-sub">Sisältää 5 testiä • Kerta-investointi</div>
+            <ul class="product-features">
+              <li>✓ Laboratoriotasoinen tarkkuus</li>
+              <li>✓ Tulos 15 minuutissa</li>
+              <li>✓ Helppo käyttää kotona</li>
+              <li>✓ Ei tarvita lähetteitä</li>
+            </ul>
+            <a href="mailto:penttivet@gmail.com?subject=Tilaus: InsuliiniCheck Laite 399€&body=Hei,%0A%0AHaluaisin tilata InsuliiniCheck-laitteen (399€).%0A%0ANimeni:%0ASähköpostini:%0APuhelinnumeroni:%0AOsoitteeni:%0A%0ATerveisin," class="btn-buy btn-buy-primary">🛒 Tilaa laite — 399 €</a>
+          </div>
+        </div>
+      </div>
+      <div class="product-card">
+        <div class="product-img">🧪</div>
+        <div class="product-name">Insuliinitesti</div>
+        <div class="product-desc">Yksittäinen insuliinitesti laitteellesi.</div>
+        <div class="product-price">15 €</div>
+        <div class="product-price-sub">per testi • min. 5 kpl</div>
+        <ul class="product-features"><li>✓ Nopea ja helppo</li><li>✓ Pienestä verinäytteestä</li><li>✓ Tulkintaohje mukana</li></ul>
+        <a href="mailto:penttivet@gmail.com?subject=Tilaus: Insuliinitestit 15€/kpl&body=Hei,%0A%0AHaluaisin tilata insuliinitestejä.%0A%0AKappalemäärä:%0ANimeni:%0ASähköpostini:%0A%0ATerveisin," class="btn-buy btn-buy-secondary">Tilaa testejä</a>
+      </div>
+      <div class="product-card">
+        <div class="product-img">📦</div>
+        <div class="product-name">Vuosipaketti</div>
+        <div class="product-desc">Laite + 12 testiä. Mittaa kerran kuukaudessa.</div>
+        <div class="product-price">549 €</div>
+        <div class="product-price-sub">Säästät 30 € • Suositellaan</div>
+        <ul class="product-features"><li>✓ Laite + 12 testiä</li><li>✓ Seurantaohjelma</li><li>✓ Asiantuntijatuki</li></ul>
+        <a href="mailto:penttivet@gmail.com?subject=Tilaus: Vuosipaketti 549€&body=Hei,%0A%0AHaluaisin tilata Vuosipaketin.%0A%0ANimeni:%0ASähköpostini:%0A%0ATerveisin," class="btn-buy btn-buy-secondary">Tilaa vuosipaketti</a>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="faq-section">
+  <div class="faq-inner">
+    <div class="section-label">UKK</div>
+    <h2 class="section-title">Usein kysytyt <em>kysymykset</em></h2>
+    <div class="faq-list">
+      <div class="faq-item"><div class="faq-q" onclick="toggleFaq(this)">Kenelle insuliinitesti sopii?<span class="faq-icon">+</span></div><div class="faq-a">Kaikille aikuisille, erityisesti jos sinulla on ylipaino, väsymystä, makeanhimo tai diabetesta suvussa.</div></div>
+      <div class="faq-item"><div class="faq-q" onclick="toggleFaq(this)">Tarvitseeko lääkärin lähetteen?<span class="faq-icon">+</span></div><div class="faq-a">Ei tarvita. Voit tilata laitteen suoraan meiltä ja testata kotona.</div></div>
+      <div class="faq-item"><div class="faq-q" onclick="toggleFaq(this)">Mitä normaalit insuliiniarvot ovat?<span class="faq-icon">+</span></div><div class="faq-a">Paastoinsuliini alle 10 mIU/L on hyvä. 10–25 viittaa alkavaan resistenssiin. Yli 25 mIU/L on selkeä merkki insuliiniresistenssistä.</div></div>
+      <div class="faq-item"><div class="faq-q" onclick="toggleFaq(this)">Kuinka usein pitäisi mitata?<span class="faq-icon">+</span></div><div class="faq-a">Aloitustilanteen kartoitukseen kerran. Elämäntapamuutosten seurannassa 1–3 kuukauden välein.</div></div>
+    </div>
+  </div>
+</div>
+
+<div class="cta-section">
+  <h2>Ota terveytesi haltuun tänään</h2>
+  <p>Älä odota lääkärin diagnoosta. Mittaa insuliinisi kotona.</p>
+  <a href="#tilaa" class="btn-cta">🛒 Tilaa InsuliiniCheck</a>
+</div>
+
+<footer>
+  <div class="footer-logo">InsuliiniCheck</div>
+  <p>penttivet@gmail.com<br>© 2026 InsuliiniCheck.fi<br><small>Tämä sivusto ei korvaa lääkärin neuvontaa.</small></p>
+</footer>
+
+<!-- CHAT FAB -->
+<button class="chat-fab" id="chatFab" onclick="toggleChat()">💬</button>
+
+<!-- CHAT WINDOW -->
+<div class="chat-window" id="chatWindow">
+  <div class="chat-header">
+    <div class="chat-avatar">🩺</div>
+    <div class="chat-header-text">
+      <h3>InsuliiniCheck Asiantuntija</h3>
+      <p>Kysy mitä tahansa insuliinista</p>
+    </div>
+    <button class="chat-close" onclick="toggleChat()">✕</button>
+  </div>
+  <div class="chat-messages" id="chatMessages">
+    <div class="msg msg-ai">Hei! 👋 Olen InsuliiniCheckin terveysasiantuntija. Voit kysyä minulta mitä tahansa insuliiniresistenssistä, diabeteksen ehkäisystä tai terveellisistä elämäntavoista. Voit myös puhua mikrofoniin! 🎙️</div>
+  </div>
+  <div class="chat-input-row">
+    <input class="chat-input" id="chatInput" placeholder="Kirjoita kysymys..." onkeydown="if(event.key==='Enter')sendMessage()">
+    <button class="chat-mic" id="micBtn" onclick="toggleVoice()" title="Puhu mikrofoniin">🎙️</button>
+    <button class="chat-send" onclick="sendMessage()">➤</button>
+  </div>
+  <button class="chat-play" id="chatPlayBtn" onclick="playResponse()">🔊 Kuuntele vastaus</button>
 </div>
 
 <script>
-let mediaRecorder=null, audioChunks=[], isRecording=false;
-let timerInterval=null, seconds=0;
-let selectedScenario=null, conversationHistory=[], audioBlob=null;
-let currentAudio=null, lastAudioUrl=null;
+let chatOpen = false;
+let chatHistory = [];
+let mediaRecorder = null, audioChunks = [], isRecording = false;
+let lastAudioUrl = null;
 
-const scenarios = {{ scenarios|tojson }};
-
-const grid = document.getElementById('scenarioGrid');
-scenarios.forEach(s => {
-  const card = document.createElement('div');
-  card.className = 'scenario-card';
-  card.innerHTML = `<div class="scenario-emoji">${s.emoji}</div><div class="scenario-title">${s.title}</div><div class="scenario-desc">${s.desc}</div>`;
-  card.onclick = () => selectScenario(s, card);
-  grid.appendChild(card);
-});
-
-function selectScenario(s, card) {
-  selectedScenario = s;
-  document.querySelectorAll('.scenario-card').forEach(c => c.classList.remove('selected'));
-  card.classList.add('selected');
-  document.getElementById('recordBtn').disabled = false;
-  document.getElementById('recordHint').textContent = `Tap to speak — ${s.title}`;
-  conversationHistory = [];
-  document.getElementById('chatHistory').innerHTML = '';
-  document.getElementById('aiBubble').classList.remove('visible');
-  document.getElementById('feedbackCard').classList.remove('visible');
-  document.getElementById('nextBtn').style.display = 'none';
-  document.getElementById('resetBtn').style.display = 'none';
+function toggleChat() {
+  chatOpen = !chatOpen;
+  document.getElementById('chatWindow').classList.toggle('open', chatOpen);
+  document.getElementById('chatFab').classList.toggle('open', chatOpen);
+  document.getElementById('chatFab').textContent = chatOpen ? '✕' : '💬';
 }
 
-function updateTimer() {
-  seconds++;
-  const m = String(Math.floor(seconds/60)).padStart(2,'0');
-  const s = String(seconds%60).padStart(2,'0');
-  document.getElementById('timer').textContent = m+':'+s;
+function toggleFaq(el) {
+  el.parentElement.classList.toggle('open');
 }
 
-async function toggleRecording() {
-  if (!selectedScenario) return;
+function addMessage(role, text) {
+  const msgs = document.getElementById('chatMessages');
+  const div = document.createElement('div');
+  div.className = 'msg ' + (role === 'user' ? 'msg-user' : 'msg-ai');
+  div.textContent = text;
+  msgs.appendChild(div);
+  msgs.scrollTop = msgs.scrollHeight;
+  return div;
+}
+
+function showTyping() {
+  const msgs = document.getElementById('chatMessages');
+  const div = document.createElement('div');
+  div.className = 'msg-typing';
+  div.id = 'typingIndicator';
+  div.innerHTML = '<div class="typing-dots"><span></span><span></span><span></span></div>';
+  msgs.appendChild(div);
+  msgs.scrollTop = msgs.scrollHeight;
+}
+
+function hideTyping() {
+  const el = document.getElementById('typingIndicator');
+  if (el) el.remove();
+}
+
+async function sendMessage() {
+  const input = document.getElementById('chatInput');
+  const text = input.value.trim();
+  if (!text) return;
+  input.value = '';
+  addMessage('user', text);
+  chatHistory.push({role:'user', content:text});
+  showTyping();
+  document.getElementById('chatPlayBtn').style.display = 'none';
+  try {
+    const resp = await fetch('/chat', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({message: text, history: chatHistory})
+    });
+    const data = await resp.json();
+    hideTyping();
+    addMessage('ai', data.reply);
+    chatHistory.push({role:'assistant', content:data.reply});
+    if (data.audio_url) {
+      lastAudioUrl = data.audio_url;
+      document.getElementById('chatPlayBtn').style.display = 'block';
+    }
+    chatHistory = chatHistory.slice(-20);
+  } catch(e) {
+    hideTyping();
+    addMessage('ai', 'Pahoittelen, tekninen ongelma. Yritä uudelleen.');
+  }
+}
+
+async function toggleVoice() {
   if (!isRecording) {
     try {
       const stream = await navigator.mediaDevices.getUserMedia({audio:true});
       mediaRecorder = new MediaRecorder(stream);
       audioChunks = [];
       mediaRecorder.ondataavailable = e => audioChunks.push(e.data);
-      mediaRecorder.onstop = () => { audioBlob = new Blob(audioChunks, {type:'audio/webm'}); processAudio(); };
+      mediaRecorder.onstop = () => processVoice(new Blob(audioChunks, {type:'audio/webm'}));
       mediaRecorder.start();
-      isRecording = true; seconds = 0;
-      timerInterval = setInterval(updateTimer, 1000);
-      document.getElementById('recordBtn').classList.add('recording');
-      document.getElementById('recordBtn').textContent = '⏹️';
-      document.getElementById('recordHint').textContent = 'Recording... tap to stop';
-      document.getElementById('timer').classList.add('visible');
-      document.getElementById('wave').classList.add('visible');
-      hideError();
-    } catch(e) { showError('Microphone not available. Please check permissions.'); }
+      isRecording = true;
+      document.getElementById('micBtn').classList.add('recording');
+      document.getElementById('micBtn').textContent = '⏹️';
+    } catch(e) { alert('Mikrofoni ei ole käytettävissä.'); }
   } else {
     mediaRecorder.stop();
     mediaRecorder.stream.getTracks().forEach(t => t.stop());
     isRecording = false;
-    clearInterval(timerInterval);
-    document.getElementById('recordBtn').classList.remove('recording');
-    document.getElementById('recordBtn').textContent = '🎙️';
-    document.getElementById('recordBtn').disabled = true;
-    document.getElementById('recordHint').textContent = 'Processing...';
-    document.getElementById('timer').classList.remove('visible');
-    document.getElementById('wave').classList.remove('visible');
+    document.getElementById('micBtn').classList.remove('recording');
+    document.getElementById('micBtn').textContent = '🎙️';
   }
 }
 
-async function processAudio() {
-  if (!audioBlob) return;
-  document.getElementById('processing').classList.add('visible');
-  document.getElementById('aiBubble').classList.remove('visible');
-  document.getElementById('feedbackCard').classList.remove('visible');
-  document.getElementById('nextBtn').style.display = 'none';
-
-  setProc(1, 'active');
-
+async function processVoice(blob) {
+  addMessage('user', '🎙️ ...');
+  showTyping();
+  document.getElementById('chatPlayBtn').style.display = 'none';
   const formData = new FormData();
-  formData.append('audio', audioBlob, 'speech.webm');
-  formData.append('scenario_id', selectedScenario.id);
-  formData.append('history', JSON.stringify(conversationHistory));
-
+  formData.append('audio', blob, 'speech.webm');
+  formData.append('history', JSON.stringify(chatHistory));
   try {
-    const resp = await fetch('/speak', {method:'POST', body:formData});
+    const resp = await fetch('/voice-chat', {method:'POST', body:formData});
     const data = await resp.json();
-    if (!resp.ok) throw new Error(data.error || 'Error');
-
-    setProc(1, 'done');
-    setProc(2, 'active');
-
-    document.getElementById('aiText').textContent = data.ai_response;
-    document.getElementById('aiBubble').classList.add('visible');
-    setProc(2, 'done');
-    setProc(3, 'active');
-
-    const fb = data.feedback;
-    const score = fb.score || 0;
-    const circle = document.getElementById('scoreCircle');
-    circle.textContent = score;
-    circle.className = 'score-circle ' + (score >= 80 ? 'score-high' : score >= 60 ? 'score-mid' : 'score-low');
-    document.getElementById('feedbackText').textContent = fb.feedback || '';
-
-    if (fb.corrected && fb.corrected !== data.transcript) {
-      document.getElementById('correctedText').textContent = fb.corrected;
-      document.getElementById('correctedBox').style.display = 'block';
-    } else {
-      document.getElementById('correctedBox').style.display = 'none';
-    }
-
-    const errorsList = document.getElementById('errorsList');
-    errorsList.innerHTML = '';
-    if (fb.errors && fb.errors.length > 0) {
-      fb.errors.forEach(e => {
-        const div = document.createElement('div');
-        div.className = 'error-item';
-        div.textContent = '⚠️ ' + e;
-        errorsList.appendChild(div);
-      });
-    }
-
-    document.getElementById('feedbackCard').classList.add('visible');
-    setProc(3, 'done');
-
-    // Play voice if available
+    hideTyping();
+    const msgs = document.getElementById('chatMessages');
+    const last = msgs.querySelectorAll('.msg-user');
+    if (last.length) last[last.length-1].textContent = data.transcript || '🎙️';
+    addMessage('ai', data.reply);
+    chatHistory.push({role:'user', content:data.transcript});
+    chatHistory.push({role:'assistant', content:data.reply});
     if (data.audio_url) {
-      setProc(4, 'active');
       lastAudioUrl = data.audio_url;
-      await playAudio(data.audio_url);
-      setProc(4, 'done');
-      const pb = document.getElementById('playBtn');
-      pb.style.display = 'block';
-      setTimeout(() => pb.scrollIntoView({behavior:'smooth', block:'center'}), 100);
-    } else {
-      document.getElementById('proc4').style.display = 'none';
+      document.getElementById('chatPlayBtn').style.display = 'block';
     }
-
-    addChatMessage('you', data.transcript);
-    addChatMessage('ai', data.ai_response);
-    conversationHistory = data.updated_history;
-
-    setTimeout(() => {
-      document.getElementById('processing').classList.remove('visible');
-      document.getElementById('nextBtn').style.display = 'block';
-      document.getElementById('resetBtn').style.display = 'block';
-    }, 500);
-
+    chatHistory = chatHistory.slice(-20);
   } catch(e) {
-    document.getElementById('processing').classList.remove('visible');
-    document.getElementById('recordBtn').disabled = false;
-    document.getElementById('recordHint').textContent = 'Tap to speak';
-    showError(e.message);
+    hideTyping();
+    addMessage('ai', 'Pahoittelen, tekninen ongelma.');
   }
 }
 
-async function playAudio(url) {
-  return new Promise((resolve) => {
-    if (currentAudio) { currentAudio.pause(); currentAudio = null; }
-    const audio = new Audio(url);
-    currentAudio = audio;
-    document.getElementById('speakingIndicator').classList.add('visible');
-    audio.onended = () => {
-      document.getElementById('speakingIndicator').classList.remove('visible');
-      currentAudio = null;
-      resolve();
-    };
-    audio.onerror = () => {
-      document.getElementById('speakingIndicator').classList.remove('visible');
-      resolve();
-    };
-    audio.play().catch(resolve);
-  });
-}
-
-function replayAudio() {
-  if (lastAudioUrl) playAudio(lastAudioUrl);
-}
-
-function setProc(num, status) {
-  const el = document.getElementById('proc'+num);
-  if (!el) return;
-  el.classList.remove('active','done');
-  const spinner = el.querySelector('.spinner');
-  if (status === 'active') {
-    el.classList.add('active');
-    if (spinner) spinner.style.opacity = '1';
-  } else if (status === 'done') {
-    el.classList.add('done');
-    if (spinner) spinner.style.display = 'none';
-    el.innerHTML = '✅ ' + el.textContent.trim();
-  }
-}
-
-function addChatMessage(role, text) {
-  const history = document.getElementById('chatHistory');
-  const div = document.createElement('div');
-  div.className = role === 'you' ? 'msg-user' : 'msg-ai';
-  div.innerHTML = `<div class="msg-label ${role}">${role === 'you' ? '🎙️ You' : '🤖 Coach'}</div>${text}`;
-  history.appendChild(div);
-  div.scrollIntoView({behavior:'smooth'});
-}
-
-function nextTurn() {
-  document.getElementById('recordBtn').disabled = false;
-  document.getElementById('recordBtn').textContent = '🎙️';
-  document.getElementById('recordHint').textContent = 'Tap to speak again';
-  document.getElementById('nextBtn').style.display = 'none';
-  document.getElementById('aiBubble').classList.remove('visible');
-  document.getElementById('feedbackCard').classList.remove('visible');
-  document.getElementById('playBtn').style.display = 'none';
-}
-
-function resetAll() {
-  selectedScenario = null;
-  conversationHistory = [];
-  lastAudioUrl = null;
-  document.querySelectorAll('.scenario-card').forEach(c => c.classList.remove('selected'));
-  document.getElementById('recordBtn').disabled = true;
-  document.getElementById('recordBtn').textContent = '🎙️';
-  document.getElementById('recordHint').textContent = 'Select a scenario to start';
-  document.getElementById('chatHistory').innerHTML = '';
-  document.getElementById('aiBubble').classList.remove('visible');
-  document.getElementById('feedbackCard').classList.remove('visible');
-  document.getElementById('nextBtn').style.display = 'none';
-  document.getElementById('resetBtn').style.display = 'none';
-  document.getElementById('timer').classList.remove('visible');
-  document.getElementById('playBtn').style.display = 'none';
-  hideError();
-}
-
-function showError(msg) { const el = document.getElementById('errorMsg'); el.textContent = '⚠️ '+msg; el.classList.add('visible'); }
-function hideError() { document.getElementById('errorMsg').classList.remove('visible'); }
-</script>
-</body>
-</html>"""
-
-
-ADMIN_HTML = """<!DOCTYPE html>
-<html lang="fi">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>SpeakUp Admin</title>
-<style>
-  @import url('https://fonts.googleapis.com/css2?family=Syne:wght@600;700;800&family=DM+Sans:wght@300;400;500&display=swap');
-  :root { --bg:#0a0a0f; --surface:#13131a; --surface2:#1c1c28; --accent:#00e5a0; --accent2:#00b8ff; --text:#f0f0f8; --text2:#7070a0; --border:rgba(255,255,255,0.06); }
-  * { margin:0; padding:0; box-sizing:border-box; }
-  body { font-family:'DM Sans',sans-serif; background:var(--bg); color:var(--text); padding:24px; }
-  .header { display:flex; align-items:center; justify-content:space-between; margin-bottom:24px; flex-wrap:wrap; gap:12px; }
-  h1 { font-family:'Syne',sans-serif; font-size:22px; background:linear-gradient(135deg,var(--accent),var(--accent2)); -webkit-background-clip:text; -webkit-text-fill-color:transparent; }
-  .stats { display:flex; gap:12px; flex-wrap:wrap; margin-bottom:24px; }
-  .stat { background:var(--surface); border-radius:12px; padding:14px 20px; border:1px solid var(--border); }
-  .stat-num { font-family:'Syne',sans-serif; font-size:28px; font-weight:700; color:var(--accent); }
-  .stat-label { font-size:12px; color:var(--text2); margin-top:2px; }
-  .search { background:var(--surface2); border:1px solid var(--border); border-radius:10px; padding:10px 16px; color:var(--text); font-size:14px; width:100%; max-width:320px; outline:none; margin-bottom:16px; }
-  .search:focus { border-color:var(--accent); }
-  table { width:100%; border-collapse:collapse; background:var(--surface); border-radius:16px; overflow:hidden; border:1px solid var(--border); }
-  th { background:var(--surface2); padding:12px 16px; text-align:left; font-size:11px; text-transform:uppercase; letter-spacing:1px; color:var(--text2); font-weight:600; }
-  td { padding:14px 16px; border-bottom:1px solid var(--border); font-size:14px; }
-  tr:last-child td { border-bottom:none; }
-  tr:hover td { background:rgba(0,229,160,0.03); }
-  .logout { padding:8px 16px; background:var(--surface2); border:1px solid var(--border); border-radius:8px; color:var(--text); text-decoration:none; font-size:13px; }
-  .empty { text-align:center; padding:48px; color:var(--text2); }
-  .date { font-size:12px; color:var(--text2); }
-</style>
-</head>
-<body>
-<div class="header">
-  <h1>🎙️ SpeakUp Admin</h1>
-  <a href="/admin/logout" class="logout">Kirjaudu ulos</a>
-</div>
-
-<div class="stats">
-  <div class="stat">
-    <div class="stat-num">{{ total }}</div>
-    <div class="stat-label">Käyttäjää yhteensä</div>
-  </div>
-  <div class="stat">
-    <div class="stat-num">{{ today }}</div>
-    <div class="stat-label">Tänään rekisteröityi</div>
-  </div>
-</div>
-
-<input class="search" type="text" id="search" placeholder="🔍 Hae nimellä tai sähköpostilla..." oninput="filterTable()">
-
-<table id="userTable">
-  <thead>
-    <tr>
-      <th>Nimi</th>
-      <th>Sähköposti</th>
-      <th>Rekisteröityi</th>
-    </tr>
-  </thead>
-  <tbody>
-    {% for u in users %}
-    <tr>
-      <td><strong>{{ u.name or '—' }}</strong></td>
-      <td>{{ u.email }}</td>
-      <td class="date">{{ u.created[:10] if u.created else '—' }}</td>
-    </tr>
-    {% endfor %}
-    {% if not users %}
-    <tr><td colspan="3" class="empty">Ei käyttäjiä vielä.</td></tr>
-    {% endif %}
-  </tbody>
-</table>
-
-<script>
-function filterTable() {
-  const q = document.getElementById('search').value.toLowerCase();
-  document.querySelectorAll('#userTable tbody tr').forEach(row => {
-    row.style.display = row.textContent.toLowerCase().includes(q) ? '' : 'none';
-  });
+function playResponse() {
+  if (!lastAudioUrl) return;
+  const audio = new Audio(lastAudioUrl);
+  audio.play();
 }
 </script>
+
 </body>
 </html>"""
 
-ADMIN_LOGIN_HTML = """<!DOCTYPE html>
-<html lang="fi">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>SpeakUp Admin</title>
-<style>
-  @import url('https://fonts.googleapis.com/css2?family=Syne:wght@700;800&family=DM+Sans:wght@400;500&display=swap');
-  :root { --bg:#0a0a0f; --surface:#13131a; --surface2:#1c1c28; --accent:#00e5a0; --accent2:#00b8ff; --text:#f0f0f8; --text2:#7070a0; --border:rgba(255,255,255,0.06); --danger:#ff6b35; }
-  * { margin:0; padding:0; box-sizing:border-box; }
-  body { font-family:'DM Sans',sans-serif; background:var(--bg); color:var(--text); min-height:100vh; display:flex; align-items:center; justify-content:center; padding:24px; }
-  .logo { font-family:'Syne',sans-serif; font-weight:800; font-size:28px; background:linear-gradient(135deg,var(--accent),var(--accent2)); -webkit-background-clip:text; -webkit-text-fill-color:transparent; text-align:center; margin-bottom:32px; }
-  .card { background:var(--surface); border-radius:20px; padding:28px; width:100%; max-width:360px; border:1px solid var(--border); }
-  .card h2 { font-family:'Syne',sans-serif; font-size:18px; margin-bottom:20px; }
-  .field { margin-bottom:14px; }
-  label { font-size:11px; color:var(--text2); text-transform:uppercase; letter-spacing:1px; display:block; margin-bottom:6px; }
-  input { background:var(--surface2); border:1px solid var(--border); border-radius:10px; padding:13px 16px; color:var(--text); font-size:15px; width:100%; outline:none; }
-  input:focus { border-color:var(--accent); }
-  button { width:100%; padding:14px; border-radius:12px; border:none; font-family:'Syne',sans-serif; font-size:15px; font-weight:700; cursor:pointer; background:linear-gradient(135deg,var(--accent),var(--accent2)); color:#0a0a0f; margin-top:8px; }
-  .error { background:rgba(255,107,53,0.1); border:1px solid rgba(255,107,53,0.3); border-radius:8px; padding:10px 14px; font-size:13px; color:var(--danger); margin-bottom:16px; }
-</style>
-</head>
-<body>
-<div style="width:100%;max-width:360px">
-  <div class="logo">SpeakUp Admin</div>
-  <div class="card">
-    <h2>Kirjaudu sisään</h2>
-    {% if error %}<div class="error">{{ error }}</div>{% endif %}
-    <form method="POST">
-      <div class="field"><label>Salasana</label><input type="password" name="password" autofocus></div>
-      <button type="submit">Kirjaudu</button>
-    </form>
-  </div>
-</div>
-</body>
-</html>"""
-
-
-AUTH_HTML = """<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>SpeakUp — {title}</title>
-<style>
-  @import url('https://fonts.googleapis.com/css2?family=Syne:wght@700;800&family=DM+Sans:wght@300;400;500&display=swap');
-  :root {{ --bg:#0a0a0f; --surface:#13131a; --surface2:#1c1c28; --accent:#00e5a0; --accent2:#00b8ff; --text:#f0f0f8; --text2:#7070a0; --border:rgba(255,255,255,0.06); --danger:#ff6b35; --success:#00e5a0; }}
-  * {{ margin:0; padding:0; box-sizing:border-box; }}
-  body {{ font-family:'DM Sans',sans-serif; background:var(--bg); color:var(--text); min-height:100vh; display:flex; flex-direction:column; align-items:center; justify-content:center; padding:24px; }}
-  .logo {{ font-family:'Syne',sans-serif; font-weight:800; font-size:32px; background:linear-gradient(135deg,var(--accent),var(--accent2)); -webkit-background-clip:text; -webkit-text-fill-color:transparent; margin-bottom:4px; text-align:center; }}
-  .tagline {{ font-size:13px; color:var(--text2); text-align:center; margin-bottom:32px; }}
-  .card {{ background:var(--surface); border-radius:20px; padding:28px; width:100%; max-width:380px; border:1px solid var(--border); }}
-  .card h2 {{ font-family:'Syne',sans-serif; font-size:18px; margin-bottom:20px; }}
-  .field {{ display:flex; flex-direction:column; gap:6px; margin-bottom:14px; }}
-  label {{ font-size:11px; color:var(--text2); font-weight:500; text-transform:uppercase; letter-spacing:1px; }}
-  input {{ background:var(--surface2); border:1px solid var(--border); border-radius:10px; padding:13px 16px; color:var(--text); font-family:'DM Sans',sans-serif; font-size:15px; width:100%; outline:none; }}
-  input:focus {{ border-color:var(--accent); }}
-  .btn {{ width:100%; padding:15px; border-radius:12px; border:none; font-family:'Syne',sans-serif; font-size:15px; font-weight:700; cursor:pointer; background:linear-gradient(135deg,var(--accent),var(--accent2)); color:#0a0a0f; margin-top:8px; }}
-  .msg {{ padding:12px 14px; border-radius:10px; font-size:13px; margin-bottom:16px; }}
-  .msg.error {{ background:rgba(255,107,53,0.1); border:1px solid rgba(255,107,53,0.3); color:var(--danger); }}
-  .msg.success {{ background:rgba(0,229,160,0.1); border:1px solid rgba(0,229,160,0.3); color:var(--success); }}
-  .link {{ text-align:center; margin-top:16px; font-size:13px; color:var(--text2); }}
-  .link a {{ color:var(--accent); text-decoration:none; }}
-</style>
-</head>
-<body>
-<div class="logo">SpeakUp</div>
-<div class="tagline">Learn English by speaking</div>
-<div class="card"><h2>{title}</h2>{msg}{form}</div>
-<div class="link">{link}</div>
-</body>
-</html>"""
-
-# ── Routes ───────────────────────────────────────────────────────────────
 @app.route("/")
-@login_required
 def index():
-    return render_template_string(MAIN_HTML, scenarios=SCENARIOS)
+    return render_template_string(HTML)
 
-@app.route("/login", methods=["GET", "POST"])
-def login():
-    msg = ""
-    if request.method == "POST":
-        email = request.form.get("email", "").lower().strip()
-        password = request.form.get("password", "")
-        user = redis_get(f"ec:user:{email}")
-        if not user or user.get("password") != hash_password(password):
-            msg = '<div class="msg error">❌ Incorrect email or password.</div>'
-        else:
-            session["user_email"] = email
-            return redirect("/")
-    form = '''<form method="POST">
-      <div class="field"><label>Email</label><input type="email" name="email" required></div>
-      <div class="field"><label>Password</label><input type="password" name="password" required></div>
-      <button class="btn" type="submit">Sign in</button>
-    </form>'''
-    link = '<a href="/register">No account? Register free</a>'
-    return render_template_string(AUTH_HTML.format(title="Sign in", msg=msg, form=form, link=link))
+@app.route("/chat", methods=["POST"])
+def chat():
+    data = request.json
+    message = data.get("message", "")
+    history = data.get("history", [])
 
-@app.route("/register", methods=["GET", "POST"])
-def register():
-    msg = ""
-    if request.method == "POST":
-        name = request.form.get("name", "").strip()
-        email = request.form.get("email", "").lower().strip()
-        password = request.form.get("password", "")
-        if redis_get(f"ec:user:{email}"):
-            msg = '<div class="msg error">❌ Email already in use.</div>'
-        elif len(password) < 6:
-            msg = '<div class="msg error">❌ Password must be at least 6 characters.</div>'
-        else:
-            redis_set(f"ec:user:{email}", {
-                "name": name, "email": email,
-                "password": hash_password(password),
-                "created": datetime.now().isoformat()
-            })
-            session["user_email"] = email
-            return redirect("/")
-    form = '''<form method="POST">
-      <div class="field"><label>Your name</label><input type="text" name="name" required></div>
-      <div class="field"><label>Email</label><input type="email" name="email" required></div>
-      <div class="field"><label>Password (min. 6 characters)</label><input type="password" name="password" required></div>
-      <button class="btn" type="submit">Create free account</button>
-    </form>'''
-    link = '<a href="/login">Already have an account? Sign in</a>'
-    return render_template_string(AUTH_HTML.format(title="Create account", msg=msg, form=form, link=link))
+    history_for_api = history[-10:]
 
-@app.route("/logout")
-def logout():
-    session.clear()
-    return redirect("/login")
+    try:
+        resp = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01"},
+            json={
+                "model": "claude-haiku-4-5-20251001",
+                "max_tokens": 300,
+                "system": SYSTEM_PROMPT,
+                "messages": history_for_api + [{"role": "user", "content": message}]
+            },
+            timeout=15
+        )
+        reply = resp.json()["content"][0]["text"].strip()
+    except Exception as e:
+        log.error(f"Claude error: {e}")
+        reply = "Pahoittelen, tekninen ongelma. Yritä uudelleen."
 
-@app.route("/speak", methods=["POST"])
-@login_required
-def speak():
+    audio_url = None
+    if ELEVENLABS_API_KEY:
+        try:
+            tts = requests.post(
+                f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVENLABS_VOICE_ID}",
+                headers={"xi-api-key": ELEVENLABS_API_KEY, "Content-Type": "application/json"},
+                json={"text": reply, "model_id": "eleven_turbo_v2", "voice_settings": {"stability": 0.5, "similarity_boost": 0.75, "speed": 0.85}},
+                timeout=15
+            )
+            if tts.ok:
+                b64 = base64.b64encode(tts.content).decode()
+                from flask import session
+                import secrets
+                key = f"ic:audio:{secrets.token_hex(8)}"
+                # Store in simple dict for now
+                app.config.setdefault('AUDIO_CACHE', {})[key] = b64
+                audio_url = f"/audio/{key.split(':')[-1]}"
+                log.info("TTS success")
+        except Exception as e:
+            log.error(f"TTS error: {e}")
+
+    return jsonify({"reply": reply, "audio_url": audio_url})
+
+@app.route("/voice-chat", methods=["POST"])
+def voice_chat():
     if "audio" not in request.files:
         return jsonify({"error": "No audio"}), 400
 
     audio_file = request.files["audio"]
-    scenario_id = request.form.get("scenario_id", "free")
     history = json.loads(request.form.get("history", "[]"))
 
-    # Step 1: Transcribe with Whisper
+    # Transcribe
     try:
         resp = requests.post(
             "https://api.openai.com/v1/audio/transcriptions",
             headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
             files={"file": ("speech.webm", audio_file.read(), "audio/webm")},
-            data={"model": "whisper-1", "language": "en"},
+            data={"model": "whisper-1"},
             timeout=60
         )
-        if not resp.ok:
-            return jsonify({"error": "Could not understand audio"}), 500
         transcript = resp.json().get("text", "").strip()
-        if not transcript:
-            return jsonify({"error": "No speech detected"}), 400
     except Exception as e:
-        log.error(f"Whisper error: {e}")
         return jsonify({"error": str(e)}), 500
 
-    # Step 2: Get AI response
-    system_prompt = SCENARIO_PROMPTS.get(scenario_id, SCENARIO_PROMPTS["free"])
-    history.append({"role": "user", "content": transcript})
+    # Get AI reply
+    history_for_api = history[-10:]
     try:
         resp2 = requests.post(
             "https://api.anthropic.com/v1/messages",
             headers={"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01"},
             json={
                 "model": "claude-haiku-4-5-20251001",
-                "max_tokens": 150,
-                "system": system_prompt,
-                "messages": history
-            },
-            timeout=15
-        )
-        ai_response = resp2.json()["content"][0]["text"].strip()
-        history.append({"role": "assistant", "content": ai_response})
-    except Exception as e:
-        log.error(f"Claude error: {e}")
-        ai_response = "I understand. Please continue."
-
-    # Step 3: Get feedback
-    scenario_title = next((s["title"] for s in SCENARIOS if s["id"] == scenario_id), "conversation")
-    feedback_prompt = FEEDBACK_PROMPT.format(speech=transcript, scenario=scenario_title)
-    try:
-        resp3 = requests.post(
-            "https://api.anthropic.com/v1/messages",
-            headers={"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01"},
-            json={
-                "model": "claude-haiku-4-5-20251001",
                 "max_tokens": 300,
-                "messages": [{"role": "user", "content": feedback_prompt}]
+                "system": SYSTEM_PROMPT,
+                "messages": history_for_api + [{"role": "user", "content": transcript}]
             },
             timeout=15
         )
-        raw = resp3.json()["content"][0]["text"].strip()
-        raw = raw.replace("```json", "").replace("```", "").strip()
-        feedback = json.loads(raw)
+        reply = resp2.json()["content"][0]["text"].strip()
     except Exception as e:
-        log.error(f"Feedback error: {e}")
-        feedback = {"corrected": transcript, "feedback": "Good effort! Keep practicing.", "errors": [], "score": 70}
+        reply = "Pahoittelen, tekninen ongelma."
 
-    # Step 4: Text-to-speech with ElevenLabs
+    # TTS
     audio_url = None
     if ELEVENLABS_API_KEY:
         try:
-            tts_resp = requests.post(
+            tts = requests.post(
                 f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVENLABS_VOICE_ID}",
-                headers={
-                    "xi-api-key": ELEVENLABS_API_KEY,
-                    "Content-Type": "application/json"
-                },
-                json={
-                    "text": ai_response,
-                    "model_id": "eleven_turbo_v2",
-                    "voice_settings": {
-                        "stability": 0.5,
-                        "similarity_boost": 0.75,
-                        "speed": 0.75
-                    }
-                },
+                headers={"xi-api-key": ELEVENLABS_API_KEY, "Content-Type": "application/json"},
+                json={"text": reply, "model_id": "eleven_turbo_v2", "voice_settings": {"stability": 0.5, "similarity_boost": 0.75, "speed": 0.85}},
                 timeout=15
             )
-            if tts_resp.ok:
-                # Tallenna audio väliaikaisesti Redisiin base64-muodossa
-                import base64
-                audio_b64 = base64.b64encode(tts_resp.content).decode()
-                audio_key = f"ec:audio:{session.get('user_email','anon')}:latest"
-                redis_set(audio_key, audio_b64, ttl=300)  # 5 min TTL
-                audio_url = "/audio/latest"
-                log.info("ElevenLabs TTS success")
-            else:
-                log.error(f"ElevenLabs error: {tts_resp.status_code} {tts_resp.text[:200]}")
+            if tts.ok:
+                import secrets
+                b64 = base64.b64encode(tts.content).decode()
+                key = secrets.token_hex(8)
+                app.config.setdefault('AUDIO_CACHE', {})[key] = b64
+                audio_url = f"/audio/{key}"
         except Exception as e:
             log.error(f"TTS error: {e}")
 
-    return jsonify({
-        "transcript": transcript,
-        "ai_response": ai_response,
-        "feedback": feedback,
-        "audio_url": audio_url,
-        "updated_history": history[-10:]
-    })
+    return jsonify({"transcript": transcript, "reply": reply, "audio_url": audio_url})
 
-@app.route("/audio/latest")
-@login_required
-def serve_audio():
-    import base64
-    audio_key = f"ec:audio:{session.get('user_email','anon')}:latest"
-    audio_b64 = redis_get(audio_key)
-    if not audio_b64:
+@app.route("/audio/<key>")
+def serve_audio(key):
+    cache = app.config.get('AUDIO_CACHE', {})
+    b64 = cache.get(key)
+    if not b64:
         return "", 404
-    audio_data = base64.b64decode(audio_b64)
+    audio_data = base64.b64decode(b64)
     return Response(audio_data, mimetype="audio/mpeg")
-
-@app.route("/admin", methods=["GET", "POST"])
-def admin():
-    if request.method == "POST":
-        if request.form.get("password") == ADMIN_PASSWORD:
-            session["admin"] = True
-            return redirect("/admin")
-        return render_template_string(ADMIN_LOGIN_HTML, error="Väärä salasana")
-    if not session.get("admin"):
-        return render_template_string(ADMIN_LOGIN_HTML, error=None)
-    keys = redis_keys("ec:user:*")
-    users = []
-    today = datetime.now().strftime("%Y-%m-%d")
-    today_count = 0
-    for key in keys:
-        user = redis_get(key)
-        if user:
-            users.append(user)
-            if user.get("created", "").startswith(today):
-                today_count += 1
-    users.sort(key=lambda x: x.get("created", ""), reverse=True)
-    return render_template_string(ADMIN_HTML, users=users, total=len(users), today=today_count)
-
-@app.route("/admin/logout")
-def admin_logout():
-    session.pop("admin", None)
-    return redirect("/admin")
 
 @app.route("/health")
 def health():
