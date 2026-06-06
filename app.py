@@ -517,15 +517,13 @@ def index():
     return render_template_string(HTML)
 
 def strip_markdown(text):
-    """Remove markdown formatting from text"""
     import re
-    text = re.sub(r'#{1,6}\s*', '', text)       # Remove # headers
-    text = re.sub(r'\*\*(.*?)\*\*', r'\1', text) # Remove **bold**
-    text = re.sub(r'\*(.*?)\*', r'\1', text)     # Remove *italic*
-    text = re.sub(r'`(.*?)`', r'\1', text)       # Remove `code`
-    text = re.sub(r'^[-•]\s*', '', text, flags=re.MULTILINE)  # Remove bullet points
-    text = re.sub(r'
-{3,}', '\n\n', text)      # Max 2 newlines
+    text = re.sub(r"#{1,6}\s*", "", text)
+    text = re.sub(r"\*\*(.*?)\*\*", r"\1", text)
+    text = re.sub(r"\*(.*?)\*", r"\1", text)
+    text = re.sub(r"`(.*?)`", r"\1", text)
+    text = re.sub(r"^[-•]\s*", "", text, flags=re.MULTILINE)
+    text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
 
 def clean_for_speech(text):
