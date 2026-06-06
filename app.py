@@ -515,6 +515,18 @@ function playResponse() {
 def index():
     return render_template_string(HTML)
 
+def clean_for_speech(text):
+    """Remove punctuation and symbols that ElevenLabs reads aloud"""
+    import re
+    # Replace common punctuation with spaces or nothing
+    text = text.replace("—", " ")
+    text = text.replace("–", " ")
+    text = text.replace("•", " ")
+    text = text.replace("€", " euroa")
+    text = re.sub(r'[;:,]', '', text)
+    text = re.sub(r'\s+', ' ', text).strip()
+    return text
+
 @app.route("/chat", methods=["POST"])
 def chat():
     data = request.json
@@ -546,7 +558,7 @@ def chat():
             tts = requests.post(
                 f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVENLABS_VOICE_ID}",
                 headers={"xi-api-key": ELEVENLABS_API_KEY, "Content-Type": "application/json"},
-                json={"text": reply, "model_id": "eleven_turbo_v2", "voice_settings": {"stability": 0.5, "similarity_boost": 0.75, "speed": 0.85}},
+                json={"text": clean_for_speech(reply), "model_id": "eleven_turbo_v2", "voice_settings": {"stability": 0.5, "similarity_boost": 0.75, "speed": 0.95}},
                 timeout=15
             )
             if tts.ok:
@@ -609,7 +621,7 @@ def voice_chat():
             tts = requests.post(
                 f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVENLABS_VOICE_ID}",
                 headers={"xi-api-key": ELEVENLABS_API_KEY, "Content-Type": "application/json"},
-                json={"text": reply, "model_id": "eleven_turbo_v2", "voice_settings": {"stability": 0.5, "similarity_boost": 0.75, "speed": 0.85}},
+                json={"text": clean_for_speech(reply), "model_id": "eleven_turbo_v2", "voice_settings": {"stability": 0.5, "similarity_boost": 0.75, "speed": 0.95}},
                 timeout=15
             )
             if tts.ok:
