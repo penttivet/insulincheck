@@ -35,7 +35,8 @@ IMPORTANT RULES:
 - Always recommend consulting a doctor for personal medical advice
 - When relevant, mention that home insulin testing with InsuliiniCheck can help monitor progress
 - Be warm, supportive and motivating
-- Never diagnose diseases — give educational information only"""
+- Never diagnose diseases — give educational information only
+- NEVER use Markdown formatting like #, ##, **, *, -, or bullet points. Write in plain text only."""
 
 HTML = """<!DOCTYPE html>
 <html lang="fi">
@@ -515,6 +516,18 @@ function playResponse() {
 def index():
     return render_template_string(HTML)
 
+def strip_markdown(text):
+    """Remove markdown formatting from text"""
+    import re
+    text = re.sub(r'#{1,6}\s*', '', text)       # Remove # headers
+    text = re.sub(r'\*\*(.*?)\*\*', r'\1', text) # Remove **bold**
+    text = re.sub(r'\*(.*?)\*', r'\1', text)     # Remove *italic*
+    text = re.sub(r'`(.*?)`', r'\1', text)       # Remove `code`
+    text = re.sub(r'^[-•]\s*', '', text, flags=re.MULTILINE)  # Remove bullet points
+    text = re.sub(r'
+{3,}', '\n\n', text)      # Max 2 newlines
+    return text.strip()
+
 def clean_for_speech(text):
     """Remove punctuation and symbols that ElevenLabs reads aloud"""
     import re
@@ -547,7 +560,7 @@ def chat():
             },
             timeout=15
         )
-        reply = resp.json()["content"][0]["text"].strip()
+        reply = strip_markdown(resp.json()["content"][0]["text"].strip())
     except Exception as e:
         log.error(f"Claude error: {e}")
         reply = "Pahoittelen, tekninen ongelma. Yritä uudelleen."
@@ -610,7 +623,7 @@ def voice_chat():
             },
             timeout=15
         )
-        reply = resp2.json()["content"][0]["text"].strip()
+        reply = strip_markdown(resp2.json()["content"][0]["text"].strip())
     except Exception as e:
         reply = "Pahoittelen, tekninen ongelma."
 
