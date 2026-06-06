@@ -569,7 +569,7 @@ def chat():
             tts = requests.post(
                 f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVENLABS_VOICE_ID}",
                 headers={"xi-api-key": ELEVENLABS_API_KEY, "Content-Type": "application/json"},
-                json={"text": clean_for_speech(reply), "model_id": "eleven_turbo_v2", "voice_settings": {"stability": 0.5, "similarity_boost": 0.75, "speed": 0.95}},
+                json={"text": clean_for_speech(reply), "model_id": "eleven_multilingual_v2", "voice_settings": {"stability": 0.5, "similarity_boost": 0.75, "speed": 0.95}},
                 timeout=15
             )
             if tts.ok:
@@ -632,7 +632,7 @@ def voice_chat():
             tts = requests.post(
                 f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVENLABS_VOICE_ID}",
                 headers={"xi-api-key": ELEVENLABS_API_KEY, "Content-Type": "application/json"},
-                json={"text": clean_for_speech(reply), "model_id": "eleven_turbo_v2", "voice_settings": {"stability": 0.5, "similarity_boost": 0.75, "speed": 0.95}},
+                json={"text": clean_for_speech(reply), "model_id": "eleven_multilingual_v2", "voice_settings": {"stability": 0.5, "similarity_boost": 0.75, "speed": 0.95}},
                 timeout=15
             )
             if tts.ok:
